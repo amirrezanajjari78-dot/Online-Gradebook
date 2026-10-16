@@ -1,0 +1,1551 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "b0fd888b-b9b5-47a9-8392-4eef5a556ae8" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>مدیریت کلاس</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700&amp;display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--tx:#1d2233;--mu:#6b7288;--bd:#e3e6ef;--pr:#5b5bf0;--p:#16a37a;--a:#e5484d;--l:#f0a020;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12141c;--card:#1c1f2b;--tx:#eceef6;--mu:#98a0b8;--bd:#2c3042;--pr:#8383ff}}
+:root[data-theme="dark"]{--bg:#12141c;--card:#1c1f2b;--tx:#eceef6;--mu:#98a0b8;--bd:#2c3042;--pr:#8383ff}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:Vazirmatn,Tahoma,sans-serif;line-height:1.7}
+.w{max-width:1000px;margin:auto;padding:14px}
+nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+nav button,.b{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--tx);padding:6px 14px;border-radius:10px;cursor:pointer}
+nav button.on,.b.pr{background:var(--pr);color:#fff;border-color:var(--pr)}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:14px}
+h2{margin:0 0 10px;font-size:18px}h3{margin:0 0 8px;font-size:15px}
+.g{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.st b{font-size:26px;display:block}.st span{color:var(--mu);font-size:13px}
+.sc{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:center;white-space:nowrap}
+td:first-child,th:first-child{text-align:right;position:sticky;right:0;background:var(--card)}
+.nm{background:none;border:0;font:inherit;color:var(--pr);font-weight:600;cursor:pointer;padding:0}
+.nm:hover{text-decoration:underline}
+.cell{width:38px;height:30px;border-radius:8px;border:1px solid var(--bd);background:none;cursor:pointer;font:inherit;color:var(--mu)}
+.cell.p{background:var(--p);color:#fff;border-color:var(--p)}.cell.a{background:var(--a);color:#fff;border-color:var(--a)}
+.cell.l{background:var(--l);color:#fff;border-color:var(--l)}
+.x{color:var(--a);cursor:pointer;border:0;background:none;font:inherit;font-size:14px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input,textarea{font:inherit;padding:6px 10px;border:1px solid var(--bd);border-radius:10px;background:var(--bg);color:var(--tx)}
+input[type=number]{width:80px;text-align:center}
+textarea{width:100%;min-height:90px}
+.bar{height:10px;border-radius:6px;background:var(--bd);overflow:hidden;min-width:80px}.bar i{display:block;height:100%;background:var(--pr)}
+.cr{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px dashed var(--bd)}
+.lg{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--mu);margin-top:8px}
+.tag{display:inline-block;padding:2px 12px;border-radius:20px;font-size:13px;color:#fff}
+.hd{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.mu{color:var(--mu);font-size:13px}
+/* class tabs */
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.top h1{margin:0;font-size:20px}
+.ctabs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px;padding:8px;background:var(--card);border:1px solid var(--bd);border-radius:14px}
+.ctabs .ct{font:inherit;border:1px solid var(--bd);background:var(--bg);color:var(--tx);padding:5px 14px;border-radius:20px;cursor:pointer;font-weight:600}
+.ctabs .ct.on{background:var(--pr);color:#fff;border-color:var(--pr)}
+.ctabs input{width:150px}
+/* seating */
+.board{text-align:center;padding:6px;border-radius:10px;background:var(--bd);color:var(--mu);font-size:13px;margin-bottom:12px}
+.rw{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.rn{width:18px;text-align:center;color:var(--mu);font-size:12px;flex:none}
+.dk{display:flex;gap:4px;flex:1;min-width:0;padding:4px;border-radius:12px;background:var(--bg);border:1px solid var(--bd)}
+.seat{flex:1;min-width:0;min-height:48px;border:1.5px dashed var(--bd);border-radius:10px;padding:2px;display:flex;align-items:stretch}
+.seat.over,.pool.over{border-color:var(--pr);background:rgba(91,91,240,.12)}
+.pool{display:flex;flex-wrap:wrap;gap:6px;min-height:54px;padding:8px;border:1.5px dashed var(--bd);border-radius:12px;margin-bottom:14px}
+.chip{display:flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid var(--bd);border-radius:10px;background:var(--card);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;font-size:12px;line-height:1.35}
+.pool .chip{width:150px}
+.seat .chip{width:100%}
+.chip .cn{flex:1;min-width:0;word-break:break-word}
+.chip.p{border-color:var(--p);background:rgba(22,163,122,.14)}
+.chip.a{border-color:var(--a);background:rgba(229,72,77,.14)}
+.chip.l{border-color:var(--l);background:rgba(240,160,32,.16)}
+.stt{flex:none;width:24px;height:24px;border-radius:50%;border:1px solid var(--bd);background:var(--card);color:var(--mu);cursor:pointer;font:inherit;font-size:11px;padding:0;touch-action:manipulation}
+.chip.p .stt{background:var(--p);color:#fff;border-color:var(--p)}.chip.a .stt{background:var(--a);color:#fff;border-color:var(--a)}.chip.l .stt{background:var(--l);color:#fff;border-color:var(--l)}
+.ghost{position:fixed;z-index:999;pointer-events:none;width:130px;transform:translate(-50%,-50%);box-shadow:0 6px 18px rgba(0,0,0,.25);opacity:.92}
+.chip.dim{opacity:.3}
+.hist button{display:block;width:100%;text-align:right;font:inherit;background:none;border:0;border-bottom:1px dashed var(--bd);padding:6px 0;cursor:pointer;color:var(--tx)}
+.hist button span{color:var(--mu);font-size:12px}
+@media(max-width:520px){.chip{font-size:11px;padding:2px 4px}.stt{width:20px;height:20px;font-size:10px}.rw{gap:4px}.pool .chip{width:46%}}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html">
+<div class="w">
+  <div class="top"><h1>🎓 مدیریت کلاس</h1>
+    <div class="row"><button class="b" data-act="exph">⬇ خروجی HTML</button><button class="b" data-act="exp">⬇ خروجی JSON</button><button class="b" data-act="imp">⬆ ورود JSON</button><input type="file" id="impf" accept=".json,application/json" style="display:none"></div></div>
+  <div class="ctabs" id="ctabs"></div>
+  <nav id="nav"></nav>
+  <div id="app"></div>
+</div>
+<script id="embedded" type="application/json">{"v":2,"cur":"c1792154691888103","classes":[{"id":"c1792154691888103","name":"کلاس نمونه","st":[{"id":"s0","name":"آرین احمدی","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s1","name":"سارا کریمی","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s2","name":"محمدرضا نوری","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s3","name":"النا رضایی","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s4","name":"پارسا موسوی","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s5","name":"مهسا حیدری","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s6","name":"کیان صادقی","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}},{"id":"s7","name":"ریحانه جعفری","rt":{"مشارکت کلاسی":10,"انضباط":10,"تکلیف":10,"خلاقیت":10,"کار گروهی":10,"دقت":10,"پیشرفت":10},"notes":{}}],"dates":["2026-10-16"],"att":{"s0":{},"s1":{},"s2":{},"s3":{},"s4":{},"s5":{},"s6":{},"s7":{}},"crs":["مشارکت کلاسی","انضباط","تکلیف","خلاقیت","کار گروهی","دقت","پیشرفت"],"exams":[],"seats":{}}],"ts":1792154704601}</script>
+<script>
+const CR0=['مشارکت کلاسی','انضباط','تکلیف','خلاقیت','کار گروهی','دقت','پیشرفت'];
+const AC={p:['✓','حاضر'],a:['✗','غایب'],l:['⏱','تأخیر']};
+const ORD=['','p','a','l'];
+const KEY='clsapp2';
+const today=()=>{const d=new Date();d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,10)};
+let DB,view='class',cmp=true,sd=today(),nd=today();
+
+/* ---------- داده ---------- */
+function newClass(name){return{id:'c'+Date.now()+Math.floor(Math.random()*999),name,st:[],dates:[],att:{},crs:[...CR0],exams:[],seats:{}}}
+function seed(){
+  const c=newClass('کلاس نمونه');
+  ['آرین احمدی','سارا کریمی','محمدرضا نوری','النا رضایی','پارسا موسوی','مهسا حیدری','کیان صادقی','ریحانه جعفری'].forEach((n,i)=>{
+    const rt={};c.crs.forEach(k=>rt[k]=10);c.st.push({id:'s'+i,name:n,rt,notes:{}});c.att['s'+i]={};
+  });
+  c.dates=[today()];
+  return{v:2,cur:c.id,classes:[c]};
+}
+function migrateOld(o){
+  const c=newClass('کلاس ۱');
+  c.crs=o.crs&&o.crs.length?o.crs:[...CR0];c.dates=o.dates||[];
+  c.st=(o.st||[]).map(s=>{const rt={};c.crs.forEach(k=>rt[k]=Math.min(10,(s.rt?.[k]||5)*2));const notes={};if(s.note)notes[today()]=s.note;return{id:s.id,name:s.name,rt,notes}});
+  c.att={};Object.keys(o.att||{}).forEach(id=>{c.att[id]={};Object.keys(o.att[id]).forEach(d=>{if(o.att[id][d]!=='e')c.att[id][d]=o.att[id][d]})});
+  return c;
+}
+function normalize(d){
+  d.classes.forEach(c=>{c.st=c.st||[];c.dates=c.dates||[];c.att=c.att||{};c.crs=c.crs||[...CR0];c.exams=c.exams||[];c.seats=c.seats||{};
+    c.st.forEach(s=>{s.rt=s.rt||{};s.notes=s.notes||{};if(s.note){s.notes[today()]=s.note;delete s.note}});
+    Object.values(c.att).forEach(m=>Object.keys(m).forEach(k=>{if(m[k]==='e')delete m[k]}));});
+  if(!d.classes.length)d.classes.push(newClass('کلاس جدید'));
+  if(!d.classes.find(c=>c.id===d.cur))d.cur=d.classes[0].id;
+  return d;
+}
+let persistNow=false;
+function load(){
+  let loc=null,emb=null;
+  try{const v=localStorage.getItem(KEY);if(v)loc=JSON.parse(v)}catch(e){}
+  try{const t=document.getElementById('embedded').textContent.trim();if(t)emb=JSON.parse(t)}catch(e){}
+  if(emb&&emb.classes){
+    if(!loc){persistNow=true;return normalize(emb)}
+    if(loc.ts!==emb.ts){
+      let seen=null;try{seen=localStorage.getItem(KEY+'_seen')}catch(e){}
+      if(String(seen)!==String(emb.ts)){
+        const use=confirm('این فایل شامل اطلاعاتی است که در '+new Date(emb.ts).toLocaleString('fa-IR')+' ذخیره شده.\nاطلاعات فعلی این مرورگر ('+new Date(loc.ts||0).toLocaleString('fa-IR')+') با اطلاعات فایل جایگزین شود؟\n\nOK = استفاده از اطلاعات فایل  |  Cancel = نگه داشتن اطلاعات مرورگر');
+        try{localStorage.setItem(KEY+'_seen',String(emb.ts))}catch(e){}
+        if(use){persistNow=true;return normalize(emb)}
+      }
+    }
+  }
+  if(loc)return normalize(loc);
+  try{const o=localStorage.getItem('clsapp');if(o){const c=migrateOld(JSON.parse(o));return normalize({v:2,cur:c.id,classes:[c]})}}catch(e){}
+  return normalize(seed());
+}
+function save(){DB.ts=Date.now();try{localStorage.setItem(KEY,JSON.stringify(DB))}catch(e){}}
+DB=load();if(persistNow)save();
+const C=()=>DB.classes.find(c=>c.id===DB.cur);
+
+/* ---------- ابزار ---------- */
+const $=s=>document.querySelector(s);
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fd=d=>new Date(d+'T12:00:00').toLocaleDateString('fa-IR',{weekday:'short',month:'numeric',day:'numeric'});
+const fdl=d=>new Date(d+'T12:00:00').toLocaleDateString('fa-IR',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+const fn=n=>Number(n).toLocaleString('fa-IR',{maximumFractionDigits:1});
+const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
+const clamp=(v,lo,hi)=>Math.min(hi,Math.max(lo,v));
+
+/* ---------- محاسبه نمره ---------- */
+const rAvg=s=>{const c=C();return avg(c.crs.map(k=>s.rt[k]??10))};            // میانگین ارزشیابی‌ها از ۱۰
+const exList=s=>C().exams.map(e=>e.scores?.[s.id]).filter(v=>v!==undefined&&v!==null&&v!==''&&!isNaN(v)).map(Number);
+const exAvg=s=>{const l=exList(s);return l.length?avg(l):null};                 // میانگین امتحان‌ها از ۲۰
+function finalScore(s){                                                         // نمره نهایی از ۱۰
+  const c=C(),parts=[];
+  if(c.crs.length)parts.push(rAvg(s));
+  const e=exAvg(s);if(e!==null)parts.push(e/2);
+  return parts.length?avg(parts):0;
+}
+const cAvg=k=>avg(C().st.map(s=>s.rt[k]??10));
+function attPct(id){const c=C();const v=c.dates.map(d=>c.att[id]?.[d]).filter(Boolean);if(!v.length)return 0;return v.filter(x=>x==='p'||x==='l').length/v.length*100}
+function dPct(d){const c=C();const v=c.st.map(s=>c.att[s.id]?.[d]).filter(Boolean);if(!v.length)return 0;return v.filter(x=>x==='p'||x==='l').length/v.length*100}
+function level(a){return a>=9?['عالی','#16a37a']:a>=7?['خوب','#3b82f6']:a>=5?['قابل قبول','#f0a020']:['نیازمند توجه','#e5484d']}
+function ensureDate(d){const c=C();if(!c.dates.includes(d)){c.dates.push(d);c.dates.sort()}}
+
+/* ---------- نمودار رادار (از ۱۰، بدون نمره امتحان) ---------- */
+function radar(vals,labels,vals2){
+  const n=labels.length,R=95,cx=170,cy=130;
+  if(n<3)return'<p class="mu">برای رسم نمودار حداقل ۳ معیار لازم است.</p>';
+  const pt=(i,v)=>{const a=-Math.PI/2+i*2*Math.PI/n,r=R*v/10;return[cx+r*Math.cos(a),cy+r*Math.sin(a)]};
+  let o=`<svg viewBox="0 0 340 260" style="width:100%;max-width:420px;display:block;margin:auto">`;
+  for(let k=1;k<=5;k++)o+=`<polygon points="${labels.map((_,i)=>pt(i,k*2).join(',')).join(' ')}" fill="none" stroke="var(--bd)"/>`;
+  labels.forEach((l,i)=>{const[x,y]=pt(i,11.8);o+=`<line x1="${cx}" y1="${cy}" x2="${pt(i,10)[0]}" y2="${pt(i,10)[1]}" stroke="var(--bd)"/><text x="${x}" y="${y}" font-size="11" text-anchor="middle" dominant-baseline="middle" fill="var(--mu)">${esc(l)}</text>`});
+  if(vals2)o+=`<polygon points="${vals2.map((v,i)=>pt(i,v).join(',')).join(' ')}" fill="none" stroke="var(--mu)" stroke-width="2" stroke-dasharray="5 4"/>`;
+  o+=`<polygon points="${vals.map((v,i)=>pt(i,v).join(',')).join(' ')}" fill="var(--pr)" fill-opacity=".25" stroke="var(--pr)" stroke-width="2.5"/>`;
+  vals.forEach((v,i)=>{const[x,y]=pt(i,v);o+=`<circle cx="${x}" cy="${y}" r="4" fill="var(--pr)"/>`});
+  return o+'</svg>';
+}
+
+/* ---------- بالای صفحه: کلاس‌ها و منو ---------- */
+function topbar(){
+  $('#ctabs').innerHTML=DB.classes.map(c=>`<button class="ct ${c.id===DB.cur?'on':''}" data-cls="${c.id}">${esc(c.name)}</button>`).join('')+
+  `<button class="x" data-act="rencls" title="تغییر نام کلاس فعلی">✎</button><button class="x" data-act="delcls" title="حذف کلاس فعلی">🗑</button>
+   <span style="flex:1"></span><input id="ncl" placeholder="نام کلاس جدید"><button class="b pr" data-act="addcls">+ افزودن کلاس</button>`;
+  const c=C();
+  $('#nav').innerHTML=[['class','📊 نمای کلی کلاس'],['att','📅 حضور و غیاب'],['seat','🪑 چیدمان کلاس'],['exam','📝 نمره امتحانی']]
+    .map(([v,t])=>`<button data-v="${v}" class="${view===v?'on':''}">${t}</button>`).join('')+
+    c.st.map(s=>`<button data-v="${s.id}" class="${view===s.id?'on':''}">${esc(s.name.split(' ')[0])}</button>`).join('');
+}
+
+/* ---------- نمای کلی ---------- */
+function vClass(){
+  const c=C();
+  const all=avg(c.st.map(finalScore)),ap=avg(c.st.map(s=>attPct(s.id)));
+  const rk=[...c.st].sort((a,b)=>finalScore(b)-finalScore(a));
+  return`<div class="g"><div class="c st"><b>${fn(c.st.length)}</b><span>دانش‌آموز</span></div><div class="c st"><b>${fn(all)} از ۱۰</b><span>میانگین نمره نهایی کلاس</span></div><div class="c st"><b>${fn(ap)}٪</b><span>میانگین حضور</span></div><div class="c st"><b>${fn(c.dates.length)}</b><span>جلسه ثبت‌شده</span></div></div>
+  <div class="g"><div class="c"><h2>رادار کلاس</h2>${radar(c.crs.map(cAvg),c.crs)}<div class="lg"><span>نمره امتحانی در نمودار اعمال نمی‌شود</span></div></div>
+  <div class="c"><h2>میانگین هر معیار (از ۱۰)</h2>${c.crs.map(k=>`<div class="cr"><span>${esc(k)} <button class="x" data-delc="${esc(k)}" title="حذف معیار">✕</button></span><span class="row" style="width:50%"><div class="bar" style="flex:1"><i style="width:${cAvg(k)*10}%"></i></div><b>${fn(cAvg(k))}</b></span></div>`).join('')}
+  <div class="row" style="margin-top:10px"><input id="nc" placeholder="معیار جدید، مثلاً: رهبری"><button class="b pr" data-act="addc">افزودن معیار</button></div></div></div>
+  <div class="c"><h2>حضور در هر جلسه</h2>${c.dates.length?`<div class="sc"><svg viewBox="0 0 ${Math.max(300,c.dates.length*70)} 150" style="width:100%;min-width:${c.dates.length*60}px">${c.dates.map((d,i)=>{const h=dPct(d)*1.0,x=i*70+15;return`<rect x="${x}" y="${115-h}" width="40" height="${h}" rx="6" fill="var(--pr)" fill-opacity=".8"/><text x="${x+20}" y="${108-h}" text-anchor="middle" font-size="11" fill="var(--tx)">${fn(dPct(d))}٪</text><text x="${x+20}" y="135" text-anchor="middle" font-size="10" fill="var(--mu)">${fd(d)}</text>`}).join('')}</svg></div>`:'<p>هنوز جلسه‌ای ثبت نشده.</p>'}</div>
+  <div class="c"><h2>رتبه‌بندی و دسترسی به کارنامه</h2><div class="sc"><table><tr><th>دانش‌آموز</th><th>میانگین ارزشیابی (۱۰)</th><th>میانگین امتحان (۲۰)</th><th>نمره نهایی (۱۰)</th><th>سطح</th><th>حضور</th><th></th></tr>
+  ${rk.map((s,i)=>{const f=finalScore(s),l=level(f),e=exAvg(s);return`<tr><td><button class="nm" data-v="${s.id}">${fn(i+1)}. ${esc(s.name)}</button></td><td>${fn(rAvg(s))}</td><td>${e===null?'–':fn(e)}</td><td><b>${fn(f)}</b></td><td><span class="tag" style="background:${l[1]}">${l[0]}</span></td><td><div class="bar"><i style="width:${attPct(s.id)}%"></i></div></td><td><button class="x" data-dels="${s.id}">حذف</button></td></tr>`}).join('')}</table></div>
+  <p class="mu" style="margin:8px 0 0">نمره نهایی = میانگین «میانگین ارزشیابی‌ها (از ۱۰)» و «میانگین نمره امتحان‌ها (از ۲۰) تقسیم بر ۲»</p>
+  <div class="row" style="margin-top:10px"><input id="ns" placeholder="نام و نام خانوادگی دانش‌آموز جدید"><button class="b pr" data-act="adds">افزودن دانش‌آموز</button></div></div>`;
+}
+
+/* ---------- حضور و غیاب ---------- */
+function vAtt(){
+  const c=C();
+  return`<div class="c"><div class="hd"><h2>جدول حضور و غیاب</h2><div class="row"><input type="date" id="nd" value="${today()}"><button class="b pr" data-act="addd">+ افزودن تاریخ</button></div></div>
+  <p class="mu" style="margin:0 0 8px">روی هر خانه کلیک کنید تا وضعیت عوض شود: خالی ← حاضر ← غایب ← تأخیر. برای کارنامه، روی نام دانش‌آموز کلیک کنید. (برای ثبت حضور با چیدمان صندلی‌ها به بخش «چیدمان کلاس» بروید.)</p>
+  <div class="sc"><table><tr><th>دانش‌آموز</th>${c.dates.map(d=>`<th>${fd(d)}<br><button class="x" data-deld="${d}" title="حذف تاریخ">✕</button></th>`).join('')}<th>درصد حضور</th></tr>
+  ${c.st.map(s=>`<tr><td><button class="nm" data-v="${s.id}">${esc(s.name)}</button></td>${c.dates.map(d=>{const v=c.att[s.id]?.[d]||'';return`<td><button class="cell ${v}" data-cell="${s.id}|${d}" title="${v?AC[v][1]:'ثبت نشده'}">${v?AC[v][0]:'–'}</button></td>`}).join('')}<td><b>${fn(attPct(s.id))}٪</b></td></tr>`).join('')}
+  <tr><td><b>حضور کلاس</b></td>${c.dates.map(d=>`<td><b>${fn(dPct(d))}٪</b></td>`).join('')}<td></td></tr></table></div>
+  <div class="lg"><span>✓ حاضر</span><span>✗ غایب</span><span>⏱ تأخیر (حاضر حساب می‌شود)</span></div></div>`;
+}
+
+/* ---------- چیدمان کلاس ---------- */
+function seatsFor(d){
+  const c=C();let a=c.seats[d];
+  if(!a)a=c.seats[d]=Array(36).fill(null);
+  const ids=new Set(c.st.map(s=>s.id));
+  for(let i=0;i<36;i++)if(a[i]&&!ids.has(a[i]))a[i]=null;
+  return a;
+}
+function chipHTML(s){
+  const c=C(),v=c.att[s.id]?.[sd]||'';
+  return`<div class="chip ${v}" data-sid="${s.id}"><span class="cn">${esc(s.name)}</span><button class="stt" data-stt="${s.id}" title="${v?AC[v][1]:'ثبت نشده'} (کلیک برای تغییر)">${v?AC[v][0]:'–'}</button></div>`;
+}
+function vSeat(){
+  const c=C(),arr=seatsFor(sd),placed=new Set(arr.filter(Boolean));
+  const byId=id=>c.st.find(s=>s.id===id);
+  const pool=c.st.filter(s=>!placed.has(s.id));
+  const cnt=k=>c.st.filter(s=>c.att[s.id]?.[sd]===k).length;
+  let rows='';
+  for(let r=0;r<6;r++){
+    let desks='';
+    for(let k=0;k<3;k++){
+      let seats='';
+      for(let j=0;j<2;j++){const i=r*6+k*2+j;seats+=`<div class="seat" data-seat="${i}">${arr[i]?chipHTML(byId(arr[i])):''}</div>`}
+      desks+=`<div class="dk">${seats}</div>`;
+    }
+    rows+=`<div class="rw"><span class="rn">${fn(r+1)}</span>${desks}</div>`;
+  }
+  const prevs=Object.keys(c.seats).filter(d=>d<sd&&c.seats[d].some(Boolean)).sort();
+  return`<div class="c"><div class="hd"><h2>چیدمان و حضور و غیاب روز</h2>
+    <div class="row"><input type="date" id="sdt" value="${sd}"><button class="b" data-act="copyprev" ${prevs.length?'':'disabled'}>کپی چیدمان جلسه قبل</button><button class="b" data-act="allp">همه حاضر</button><button class="b" data-act="clrseat">خالی کردن چیدمان</button></div></div>
+    <p class="mu" style="margin:0 0 10px">${esc(fdl(sd))} — نام‌ها را بکشید و روی صندلی بیندازید. دایرهٔ کنار هر نام را بزنید تا حاضر / غایب / تأخیر ثبت شود. برای برداشتن، نام را به کادر بالا برگردانید.</p>
+    <div class="row" style="margin-bottom:8px"><span class="tag" style="background:var(--p)">حاضر ${fn(cnt('p'))}</span><span class="tag" style="background:var(--a)">غایب ${fn(cnt('a'))}</span><span class="tag" style="background:var(--l)">تأخیر ${fn(cnt('l'))}</span><span class="mu">نشسته: ${fn(placed.size)} از ${fn(c.st.length)}</span></div>
+    <h3>دانش‌آموزان (جا نگرفته)</h3><div class="pool" id="pool">${pool.map(chipHTML).join('')||'<span class="mu">همه دانش‌آموزان روی صندلی نشسته‌اند ✔</span>'}</div>
+    <div class="board">🧑‍🏫 تخته / میز معلم</div>${rows}
+    <p class="mu" style="margin:6px 0 0">۶ ردیف × ۳ میز × ۲ نفر = ۳۶ صندلی</p></div>`;
+}
+
+/* ---------- نمره امتحانی ---------- */
+function vExam(){
+  const c=C();
+  return`<div class="c"><div class="hd"><h2>نمره‌های امتحانی (از ۲۰)</h2>
+    <div class="row"><input id="ent" placeholder="عنوان امتحان، مثلاً: امتحان ۱"><input type="date" id="end" value="${today()}"><button class="b pr" data-act="addex">+ امتحان جدید</button></div></div>
+  ${c.exams.length?`<div class="sc"><table><tr><th>دانش‌آموز</th>${c.exams.map(e=>`<th>${esc(e.title)}<br><span class="mu">${fd(e.date)}</span> <button class="x" data-delex="${e.id}" title="حذف امتحان">✕</button></th>`).join('')}<th>میانگین (۲۰)</th><th>÷۲ (از ۱۰)</th></tr>
+  ${c.st.map(s=>{const m=exAvg(s);return`<tr><td><button class="nm" data-v="${s.id}">${esc(s.name)}</button></td>${c.exams.map(e=>`<td><input type="number" min="0" max="20" step="0.25" value="${e.scores?.[s.id]??''}" data-ex="${e.id}|${s.id}"></td>`).join('')}<td><b>${m===null?'–':fn(m)}</b></td><td><b>${m===null?'–':fn(m/2)}</b></td></tr>`}).join('')}
+  <tr><td><b>میانگین کلاس</b></td>${c.exams.map(e=>{const v=c.st.map(s=>e.scores?.[s.id]).filter(x=>x!==undefined&&x!==''&&x!==null).map(Number);return`<td><b>${v.length?fn(avg(v)):'–'}</b></td>`}).join('')}<td></td><td></td></tr></table></div>`:'<p class="mu">هنوز امتحانی ثبت نشده. عنوان و تاریخ را وارد کنید و «امتحان جدید» را بزنید.</p>'}
+  <p class="mu" style="margin:8px 0 0">میانگین نمره‌های هر دانش‌آموز بر ۲ تقسیم می‌شود و با میانگین ارزشیابی‌ها (از ۱۰) نمره نهایی را می‌سازد. این نمره در نمودار رادار اعمال نمی‌شود.</p></div>`;
+}
+
+/* ---------- کارنامه دانش‌آموز ---------- */
+function vStu(s){
+  const c=C(),f=finalScore(s),l=level(f),e=exAvg(s),ra=rAvg(s);
+  const cnt=k=>c.dates.filter(d=>c.att[s.id]?.[d]===k).length;
+  const best=[...c.crs].sort((x,y)=>(s.rt[y]??10)-(s.rt[x]??10));
+  const noteDates=Object.keys(s.notes).filter(d=>s.notes[d]&&s.notes[d].trim()).sort().reverse();
+  return`<div class="c hd"><div><h2 style="margin:0">${esc(s.name)}</h2><span class="tag" style="background:${l[1]}">${l[0]}</span></div><label class="row"><input type="checkbox" id="cmp" ${cmp?'checked':''}> مقایسه با میانگین کلاس</label></div>
+  <div class="g"><div class="c st"><b>${fn(f)} از ۱۰</b><span>نمره نهایی</span></div><div class="c st"><b>${fn(ra)} از ۱۰</b><span>میانگین ارزشیابی‌ها</span></div><div class="c st"><b>${e===null?'–':fn(e)+' از ۲۰'}</b><span>میانگین نمره امتحانی</span></div><div class="c st"><b>${fn(attPct(s.id))}٪</b><span>درصد حضور</span></div></div>
+  <div class="g"><div class="c st"><b>${esc(best[0]||'-')}</b><span>نقطه قوت</span></div><div class="c st"><b>${esc(best[best.length-1]||'-')}</b><span>نیازمند تمرین بیشتر</span></div></div>
+  <div class="g"><div class="c"><h2>نمودار ارزشیابی</h2>${radar(c.crs.map(k=>s.rt[k]??10),c.crs,cmp?c.crs.map(cAvg):null)}<div class="lg"><span style="color:var(--pr)">▬ ${esc(s.name.split(' ')[0])}</span>${cmp?'<span>┅ میانگین کلاس</span>':''}<span>(نمره امتحانی در نمودار نیست)</span></div></div>
+  <div class="c"><h2>ارزشیابی (از ۱۰)</h2>${c.crs.map((k,i)=>`<div class="cr"><span>${esc(k)}</span><input type="number" min="0" max="10" step="0.25" value="${s.rt[k]??10}" data-rt="${s.id}|${i}"></div>`).join('')}</div></div>
+  <div class="g"><div class="c"><h2>نمره‌های امتحانی</h2>${c.exams.length?c.exams.map(x=>`<div class="cr"><span>${esc(x.title)} <span class="mu">${fd(x.date)}</span></span><b>${x.scores?.[s.id]!==undefined&&x.scores[s.id]!==''?fn(x.scores[s.id])+' از ۲۰':'–'}</b></div>`).join(''):'<p class="mu">امتحانی ثبت نشده.</p>'}
+  <h2 style="margin-top:14px">وضعیت حضور</h2><div class="row"><span class="tag" style="background:var(--p)">حاضر ${fn(cnt('p'))}</span><span class="tag" style="background:var(--a)">غایب ${fn(cnt('a'))}</span><span class="tag" style="background:var(--l)">تأخیر ${fn(cnt('l'))}</span></div>
+  <div class="row" style="margin-top:10px">${c.dates.map(d=>{const v=c.att[s.id]?.[d]||'';return`<div style="text-align:center;font-size:11px;color:var(--mu)"><div class="cell ${v}" style="display:flex;align-items:center;justify-content:center;margin:auto">${v?AC[v][0]:'–'}</div>${fd(d)}</div>`}).join('')}</div></div>
+  <div class="c"><h2>یادداشت معلم (بر اساس تاریخ)</h2>
+  <div class="row" style="margin-bottom:8px"><input type="date" id="ndn" value="${nd}"><span class="mu">${esc(fdl(nd))}</span></div>
+  <textarea id="note" data-note="${s.id}" placeholder="مشاهدات، پیشنهادها، نکات تشویقی همین روز...">${esc(s.notes[nd]||'')}</textarea>
+  <div class="mu" style="margin-top:4px">به‌صورت خودکار ذخیره می‌شود.</div>
+  ${noteDates.length?`<h3 style="margin-top:12px">یادداشت‌های قبلی</h3><div class="hist">${noteDates.map(d=>`<button data-pickd="${d}"><b>${fd(d)}</b> <span>${esc(s.notes[d].slice(0,60))}${s.notes[d].length>60?'…':''}</span></button>`).join('')}</div>`:''}</div></div>`;
+}
+
+/* ---------- رندر ---------- */
+function render(keep){
+  const y=scrollY;
+  topbar();
+  const c=C(),s=c.st.find(x=>x.id===view);
+  if(!s&&!['class','att','seat','exam'].includes(view))view='class';
+  $('#app').innerHTML=view==='class'?vClass():view==='att'?vAtt():view==='seat'?vSeat():view==='exam'?vExam():vStu(s);
+  if(keep)scrollTo(0,y);else scrollTo(0,0);
+}
+
+/* ---------- رویدادها ---------- */
+function jalaliStamp(){
+  const p=Object.fromEntries(new Intl.DateTimeFormat('en-u-ca-persian-nu-latn',{year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date()).map(x=>[x.type,x.value]));
+  return p.year+'-'+p.month+'-'+p.day;
+}
+function download(blob,name){
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function exportJSON(){
+  download(new Blob([JSON.stringify(DB,null,2)],{type:'application/json'}),'مدیریت-کلاس-'+jalaliStamp()+'.json');
+}
+function exportHTML(){
+  save();
+  const cl=document.documentElement.cloneNode(true);
+  ['#ctabs','#nav','#app'].forEach(q=>cl.querySelector(q).innerHTML='');
+  cl.querySelectorAll('.ghost').forEach(x=>x.remove());
+  cl.querySelector('#embedded').textContent=JSON.stringify(DB).replace(/</g,'\u003c');
+  download(new Blob(['<!DOCTYPE html>\n'+cl.outerHTML],{type:'text/html'}),'مدیریت-کلاس-'+jalaliStamp()+'.html');
+}
+document.addEventListener('click',e=>{
+  const t=e.target.closest('[data-v],[data-cls],[data-cell],[data-stt],[data-act],[data-deld],[data-delc],[data-dels],[data-delex],[data-pickd]');if(!t)return;
+  const D=t.dataset,c=C();
+  if(D.cls){DB.cur=D.cls;view='class';save();render();return}
+  if(D.v){view=D.v;render();return}
+  if(D.pickd){nd=D.pickd;render(true);return}
+  if(D.cell){const[id,d]=D.cell.split('|');const cur=c.att[id]?.[d]||'';c.att[id]=c.att[id]||{};const nx=ORD[(ORD.indexOf(cur)+1)%ORD.length];if(nx)c.att[id][d]=nx;else delete c.att[id][d];save();render(true);return}
+  if(D.stt){ensureDate(sd);const cur=c.att[D.stt]?.[sd]||'';c.att[D.stt]=c.att[D.stt]||{};const nx=ORD[(ORD.indexOf(cur)+1)%ORD.length];if(nx)c.att[D.stt][sd]=nx;else delete c.att[D.stt][sd];save();render(true);return}
+  if(D.deld){if(confirm('این تاریخ حذف شود؟')){c.dates=c.dates.filter(d=>d!==D.deld);save();render(true)}return}
+  if(D.delc){if(confirm('این معیار حذف شود؟')){c.crs=c.crs.filter(k=>k!==D.delc);save();render(true)}return}
+  if(D.dels){if(confirm('این دانش‌آموز حذف شود؟')){c.st=c.st.filter(s=>s.id!==D.dels);save();render(true)}return}
+  if(D.delex){if(confirm('این امتحان حذف شود؟')){c.exams=c.exams.filter(x=>x.id!==D.delex);save();render(true)}return}
+  switch(D.act){
+    case'exp':exportJSON();break;
+    case'exph':exportHTML();break;
+    case'imp':$('#impf').click();break;
+    case'addcls':{const v=$('#ncl').value.trim();if(v){const n=newClass(v);DB.classes.push(n);DB.cur=n.id;view='class';save();render()}break}
+    case'rencls':{const v=prompt('نام جدید کلاس:',c.name);if(v&&v.trim()){c.name=v.trim();save();render(true)}break}
+    case'delcls':{if(confirm('کلاس «'+c.name+'» با همه اطلاعاتش حذف شود؟')){DB.classes=DB.classes.filter(x=>x.id!==c.id);normalize(DB);view='class';save();render()}break}
+    case'addd':{const v=$('#nd').value;if(v&&!c.dates.includes(v)){c.dates.push(v);c.dates.sort();save();render(true)}break}
+    case'addc':{const v=$('#nc').value.trim();if(v&&!c.crs.includes(v)){c.crs.push(v);c.st.forEach(s=>s.rt[v]=10);save();render(true)}break}
+    case'adds':{const v=$('#ns').value.trim();if(v){const id='s'+Date.now(),rt={};c.crs.forEach(k=>rt[k]=10);c.st.push({id,name:v,rt,notes:{}});c.att[id]={};save();render(true)}break}
+    case'addex':{const v=$('#ent').value.trim()||('امتحان '+fn(c.exams.length+1));c.exams.push({id:'e'+Date.now(),title:v,date:$('#end').value||today(),scores:{}});save();render(true);break}
+    case'allp':{ensureDate(sd);c.st.forEach(s=>{c.att[s.id]=c.att[s.id]||{};c.att[s.id][sd]='p'});save();render(true);break}
+    case'clrseat':{if(confirm('چیدمان این روز خالی شود؟')){c.seats[sd]=Array(36).fill(null);save();render(true)}break}
+    case'copyprev':{const prevs=Object.keys(c.seats).filter(d=>d<sd&&c.seats[d].some(Boolean)).sort();if(prevs.length){c.seats[sd]=[...c.seats[prevs[prevs.length-1]]];ensureDate(sd);save();render(true)}break}
+  }
+});
+document.addEventListener('change',e=>{
+  const t=e.target,c=C();
+  if(t.id==='cmp'){cmp=t.checked;render(true);return}
+  if(t.id==='sdt'&&t.value){sd=t.value;render(true);return}
+  if(t.id==='ndn'&&t.value){nd=t.value;render(true);return}
+  if(t.dataset.rt){const[id,i]=t.dataset.rt.split('|');const s=c.st.find(x=>x.id===id);let v=parseFloat(t.value);if(isNaN(v))v=10;s.rt[c.crs[+i]]=clamp(v,0,10);save();render(true);return}
+  if(t.dataset.ex){const[eid,sid]=t.dataset.ex.split('|');const ex=c.exams.find(x=>x.id===eid);ex.scores=ex.scores||{};let v=parseFloat(t.value);if(isNaN(v))delete ex.scores[sid];else ex.scores[sid]=clamp(v,0,20);save();render(true);return}
+  if(t.id==='impf'&&t.files[0]){
+    const rd=new FileReader();
+    rd.onload=()=>{try{
+      let o=JSON.parse(rd.result),n;
+      if(o.classes)n=normalize(o);else if(o.st){const k=migrateOld(o);n=normalize({v:2,cur:k.id,classes:[k]})}else throw 0;
+      if(confirm('اطلاعات فعلی با فایل انتخاب‌شده جایگزین شود؟')){DB=n;view='class';save();render()}
+    }catch(err){alert('فایل JSON معتبر نیست.')}t.value=''};
+    rd.readAsText(t.files[0]);
+  }
+});
+document.addEventListener('input',e=>{
+  const t=e.target;
+  if(t.dataset.note){const s=C().st.find(x=>x.id===t.dataset.note);if(t.value.trim())s.notes[nd]=t.value;else delete s.notes[nd];save()}
+});
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='ncl'){document.querySelector('[data-act=addcls]').click()}});
+
+/* ---------- درگ و دراپ (ماوس و لمس) ---------- */
+let drag=null;
+const clearOver=()=>document.querySelectorAll('.over').forEach(x=>x.classList.remove('over'));
+document.addEventListener('pointerdown',e=>{
+  const ch=e.target.closest('.chip');if(!ch||e.target.closest('.stt'))return;
+  if(e.pointerType==='mouse'&&e.button!==0)return;
+  drag={sid:ch.dataset.sid,el:ch,x:e.clientX,y:e.clientY,on:false,ghost:null};
+});
+document.addEventListener('pointermove',e=>{
+  if(!drag)return;
+  if(!drag.on){
+    if(Math.hypot(e.clientX-drag.x,e.clientY-drag.y)<6)return;
+    drag.on=true;drag.ghost=drag.el.cloneNode(true);drag.ghost.classList.add('ghost');document.body.appendChild(drag.ghost);drag.el.classList.add('dim');
+  }
+  drag.ghost.style.left=e.clientX+'px';drag.ghost.style.top=e.clientY+'px';
+  clearOver();
+  const el=document.elementFromPoint(e.clientX,e.clientY);
+  const tg=el&&(el.closest('.seat')||el.closest('.pool'));if(tg)tg.classList.add('over');
+  e.preventDefault();
+});
+function endDrag(e,drop){
+  if(!drag)return;
+  const d=drag;drag=null;
+  if(!d.on)return;
+  d.ghost.remove();clearOver();
+  if(!drop){d.el.classList.remove('dim');return}
+  const el=document.elementFromPoint(e.clientX,e.clientY);
+  const seat=el&&el.closest('.seat'),pool=el&&el.closest('.pool');
+  const arr=seatsFor(sd);
+  if(seat){
+    ensureDate(sd);
+    const i=+seat.dataset.seat,from=arr.indexOf(d.sid),occ=arr[i];
+    arr[i]=d.sid;
+    if(from>=0&&from!==i)arr[from]=occ||null;
+    save();
+  }else if(pool){
+    const from=arr.indexOf(d.sid);if(from>=0){arr[from]=null;save()}
+  }
+  render(true);
+}
+document.addEventListener('pointerup',e=>endDrag(e,true));
+document.addEventListener('pointercancel',e=>endDrag(e,false));
+
+render();
+</script>
+
+</body></html>
